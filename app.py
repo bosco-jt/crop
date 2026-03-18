@@ -319,72 +319,79 @@ def find_document_by_text(img_resized, margin_pct=0.05):
     """
     Detect document area by finding text regions using MSER.
     The bounding box of all text regions approximates the document area.
-    Works well even with textured backgrounds or hands holding the document.
-    
-    Returns (x, y, w, h) bounding rect or None.
     """
     h, w = img_resized.shape[:2]
     image_area = h * w
     gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
 
-    # Use MSER to detect text-like regions
     mser = cv2.MSER_create()
-    mser.setMinArea(60)
-    mser.setMaxArea(int(image_area * 0.01))  # Text regions are small
+    mser.setMinArea(80)
+    mser.setMaxArea(int(image_area * 0.005))
 
     regions, _ = mser.detectRegions(gray)
 
     if len(regions) < 5:
-        # Not enough text regions found
         return None
 
-    # Get bounding boxes for all detected regions
-    all_points = []
+    # Filter text-like regions more strictly
+    text_boxes = []
     for region in regions:
         x, y, rw, rh = cv2.boundingRect(region)
-        # Filter: text regions should be small and have reasonable aspect ratio
-        if rw > 5 and rh > 5 and rw < w * 0.5 and rh < h * 0.3:
-            all_points.append([x, y])
-            all_points.append([x + rw, y + rh])
+        # Text regions: small, roughly square or wider than tall
+        if rw < 3 or rh < 3:
+            continue
+        if rw > w * 0.3 or rh > h * 0.15:
+            continue
+        region_aspect = max(rw, rh) / max(min(rw, rh), 1)
+        if region_aspect > 10:
+            continue
+        text_boxes.append([x, y, x + rw, y + rh])
 
-    if len(all_points) < 10:
+    if len(text_boxes) < 10:
         return None
 
-    all_points = np.array(all_points)
+    text_boxes = np.array(text_boxes)
 
-    # Get the bounding box of all text regions
-    min_x = np.min(all_points[:, 0])
-    min_y = np.min(all_points[:, 1])
-    max_x = np.max(all_points[:, 0])
-    max_y = np.max(all_points[:, 1])
+    # Remove outliers using IQR on both x and y positions
+    for axis in [0, 1]:  # x_min, y_min
+        vals = text_boxes[:, axis]
+        q1, q3 = np.percentile(vals, [15, 85])
+        iqr = q3 - q1
+        mask = (vals >= q1 - 1.5 * iqr) & (vals <= q3 + 1.5 * iqr)
+        text_boxes = text_boxes[mask]
+
+    if len(text_boxes) < 5:
+        return None
+
+    min_x = np.min(text_boxes[:, 0])
+    min_y = np.min(text_boxes[:, 1])
+    max_x = np.max(text_boxes[:, 2])
+    max_y = np.max(text_boxes[:, 3])
 
     text_w = max_x - min_x
     text_h = max_y - min_y
     text_area = text_w * text_h
 
-    # Text area should be between 10% and 80% of image
-    if text_area < image_area * 0.10 or text_area > image_area * 0.80:
+    if text_area < image_area * 0.08 or text_area > image_area * 0.80:
         return None
 
-    # Check aspect ratio is document-like (between 1.2 and 2.5)
     aspect = max(text_w, text_h) / max(min(text_w, text_h), 1)
     if aspect < 1.1 or aspect > 3.0:
         return None
 
-    # Add margin around the text area (document extends beyond text)
-    margin_x = int(text_w * margin_pct)
-    margin_y = int(text_h * margin_pct)
-
-    x = max(0, min_x - margin_x)
-    y = max(0, min_y - margin_y)
-    bw = min(w - x, text_w + 2 * margin_x)
-    bh = min(h - y, text_h + 2 * margin_y)
+    # Add margin
+    mx = int(text_w * margin_pct)
+    my = int(text_h * margin_pct)
+    x = max(0, min_x - mx)
+    y = max(0, min_y - my)
+    bw = min(w - x, text_w + 2 * mx)
+    bh = min(h - y, text_h + 2 * my)
 
     return (x, y, bw, bh)
 
 
 def detect_and_crop_document(img, margin_pct=0.02):
-    """Detect the document contour and crop it."""
+    """Detect the document contour and crop it. Returns (image, detected, strategy)."""
     original = img.copy()
     height, width = img.shape[:2]
 
@@ -396,15 +403,14 @@ def detect_and_crop_document(img, margin_pct=0.02):
     else:
         img_resized = img.copy()
 
-    # Strategy 1: Try contour-based detection (best for documents on surfaces)
+    img_area = img_resized.shape[0] * img_resized.shape[1]
+
+    # Strategy 1: Contour-based (best for documents on clean surfaces)
     doc_contour = find_document_contour(img_resized)
 
     if doc_contour is not None:
-        # Verify contour isn't too large (could be background)
         contour_area = cv2.contourArea(doc_contour)
-        img_area = img_resized.shape[0] * img_resized.shape[1]
-
-        if contour_area < img_area * 0.75:
+        if contour_area < img_area * 0.70:
             doc_contour_scaled = (doc_contour / scale).astype(int)
             pts = doc_contour_scaled.reshape(4, 2)
             rect = order_points(pts)
@@ -428,7 +434,7 @@ def detect_and_crop_document(img, margin_pct=0.02):
 
             matrix = cv2.getPerspectiveTransform(rect.astype("float32"), dst)
             warped = cv2.warpPerspective(original, matrix, (max_width, max_height))
-            return warped, True
+            return warped, True, "contour"
 
     # Strategy 2: Text-based detection (handles hands, textured backgrounds)
     text_rect = find_document_by_text(img_resized)
@@ -447,7 +453,7 @@ def detect_and_crop_document(img, margin_pct=0.02):
         w = min(width - x, w + 2 * margin_x)
         h = min(height - y, h + 2 * margin_y)
 
-        return original[y:y+h, x:x+w], True
+        return original[y:y+h, x:x+w], True, "text"
 
     # Strategy 3: Bounding rect fallback
     bounding = find_document_bounding_rect(img_resized)
@@ -466,10 +472,9 @@ def detect_and_crop_document(img, margin_pct=0.02):
         w = min(width - x, w + 2 * margin_x)
         h = min(height - y, h + 2 * margin_y)
 
-        return original[y:y+h, x:x+w], True
+        return original[y:y+h, x:x+w], True, "bounding"
 
-    # Nothing detected: return original
-    return original, False
+    return original, False, "none"
 
 
 # ─── ROUTES ────────────────────────────────────────────────────────
@@ -519,8 +524,9 @@ def crop():
         # Route based on type
         if img_type == "foto":
             cropped, detected = crop_face_portrait(img)
+            strategy = "face"
         else:
-            cropped, detected = detect_and_crop_document(img, margin_pct)
+            cropped, detected, strategy = detect_and_crop_document(img, margin_pct)
 
         # Evaluate quality
         quality = evaluate_quality(cropped, detected)
@@ -542,7 +548,8 @@ def crop():
                 "X-Quality-Contrast": str(quality["contrast"]),
                 "X-Document-Detected": str(detected).lower(),
                 "X-Crop-Type": img_type,
-                "Access-Control-Expose-Headers": "X-Quality-Overall, X-Quality-Sharpness, X-Quality-Lighting, X-Quality-Resolution, X-Quality-Contrast, X-Document-Detected, X-Crop-Type"
+                "X-Crop-Strategy": strategy,
+                "Access-Control-Expose-Headers": "X-Quality-Overall, X-Quality-Sharpness, X-Quality-Lighting, X-Quality-Resolution, X-Quality-Contrast, X-Document-Detected, X-Crop-Type, X-Crop-Strategy"
             }
         )
         return response

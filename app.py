@@ -460,14 +460,17 @@ def find_document_by_gemini(img):
         if not success:
             return None, "encode_failed"
         img_b64 = base64.b64encode(buffer.tobytes()).decode("utf-8")
+        img_h, img_w = img.shape[:2]
 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+
+        prompt = f'This image is {img_w}x{img_h} pixels. Find the rectangular document (ID card, credit card, passport or similar) in the photo. Return the bounding box that contains the ENTIRE document with a small margin. It is much better to include too much background than to cut any part of the document. Return ONLY a valid JSON object: {{"x": 0, "y": 0, "width": 0, "height": 0}}. Values must be in pixels for the {img_w}x{img_h} image. No markdown, no explanation, no backticks, ONLY the JSON.'
 
         payload = {
             "contents": [{
                 "parts": [
                     {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}},
-                    {"text": 'Look at this photo and find the rectangular document (ID card, credit card, passport or similar). Return the bounding box that fits tightly around the document edges. Return ONLY a valid JSON object: {"x": 0, "y": 0, "width": 0, "height": 0}. x and y are the top-left corner, width and height are the box dimensions, all in pixels. No markdown, no explanation, no backticks, ONLY the JSON.'}
+                    {"text": prompt}
                 ]
             }],
             "generationConfig": {"temperature": 0, "maxOutputTokens": 1000}
@@ -485,8 +488,6 @@ def find_document_by_gemini(img):
         y = int(coords["y"])
         w = int(coords["width"])
         h = int(coords["height"])
-
-        img_h, img_w = img.shape[:2]
         if x < 0 or y < 0 or w < 50 or h < 50:
             return None, f"invalid_coords|x={x},y={y},w={w},h={h}"
         if x + w > img_w * 1.1 or y + h > img_h * 1.1:

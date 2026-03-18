@@ -1,0 +1,5 @@
+flask==3.1.*
+gunicorn==23.*
+opencv-python-headless==4.9.*
+numpy>=1.24,<2
+requests>=2.31,<3

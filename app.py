@@ -450,20 +450,17 @@ def find_document_by_smoothness(img_resized):
 def find_document_by_gemini(img):
     """
     Use Gemini Flash to detect document bounding box.
-    Fallback when OpenCV strategies fail.
-    Returns (x, y, w, h) in original image pixels or None.
+    Returns ((x, y, w, h), None) on success, (None, error_msg) on failure.
     """
     if not GEMINI_API_KEY:
-        return None
+        return None, "no_api_key"
 
     try:
-        # Encode image to base64
         success, buffer = cv2.imencode(".jpeg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if not success:
-            return None
+            return None, "encode_failed"
         img_b64 = base64.b64encode(buffer.tobytes()).decode("utf-8")
 
-        # Call Gemini API
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
         payload = {
@@ -489,18 +486,16 @@ def find_document_by_gemini(img):
         w = int(coords["width"])
         h = int(coords["height"])
 
-        # Basic validation
         img_h, img_w = img.shape[:2]
         if x < 0 or y < 0 or w < 50 or h < 50:
-            return None
+            return None, f"invalid_coords|x={x},y={y},w={w},h={h}"
         if x + w > img_w * 1.1 or y + h > img_h * 1.1:
-            return None
+            return None, f"out_of_bounds|x={x},y={y},w={w},h={h}|img={img_w}x{img_h}"
 
-        return (x, y, w, h)
+        return (x, y, w, h), None
 
     except Exception as e:
-        print(f"Gemini fallback error: {e}")
-        return None
+        return None, str(e)
 
 
 def detect_and_crop_document(img, margin_pct=0.02):
@@ -607,7 +602,7 @@ def detect_and_crop_document(img, margin_pct=0.02):
         debug["smooth"] = "none_found"
 
     # Strategy 4: Gemini AI fallback (handles complex backgrounds)
-    gemini_rect = find_document_by_gemini(original)
+    gemini_rect, gemini_err = find_document_by_gemini(original)
 
     if gemini_rect is not None:
         gx, gy, gw, gh = gemini_rect
@@ -623,7 +618,7 @@ def detect_and_crop_document(img, margin_pct=0.02):
 
         return original[y:y+h, x:x+w], True, "gemini", debug
     else:
-        debug["gemini"] = "none_found"
+        debug["gemini"] = f"failed|{gemini_err}"
 
     # Strategy 5: Bounding rect fallback
     bounding = find_document_bounding_rect(img_resized)

@@ -318,7 +318,6 @@ def find_document_bounding_rect(img_resized):
 def find_document_by_text(img_resized, margin_pct=0.05):
     """
     Detect document area by finding text regions using MSER.
-    The bounding box of all text regions approximates the document area.
     """
     h, w = img_resized.shape[:2]
     image_area = h * w
@@ -333,11 +332,9 @@ def find_document_by_text(img_resized, margin_pct=0.05):
     if len(regions) < 5:
         return None
 
-    # Filter text-like regions more strictly
     text_boxes = []
     for region in regions:
         x, y, rw, rh = cv2.boundingRect(region)
-        # Text regions: small, roughly square or wider than tall
         if rw < 3 or rh < 3:
             continue
         if rw > w * 0.3 or rh > h * 0.15:
@@ -352,8 +349,7 @@ def find_document_by_text(img_resized, margin_pct=0.05):
 
     text_boxes = np.array(text_boxes)
 
-    # Remove outliers using IQR on both x and y positions
-    for axis in [0, 1]:  # x_min, y_min
+    for axis in [0, 1]:
         vals = text_boxes[:, axis]
         q1, q3 = np.percentile(vals, [15, 85])
         iqr = q3 - q1
@@ -379,7 +375,6 @@ def find_document_by_text(img_resized, margin_pct=0.05):
     if aspect < 1.1 or aspect > 3.0:
         return None
 
-    # Add margin
     mx = int(text_w * margin_pct)
     my = int(text_h * margin_pct)
     x = max(0, min_x - mx)
@@ -388,6 +383,64 @@ def find_document_by_text(img_resized, margin_pct=0.05):
     bh = min(h - y, text_h + 2 * my)
 
     return (x, y, bw, bh)
+
+
+def find_document_by_smoothness(img_resized):
+    """
+    Detect document by finding the largest smooth/uniform region.
+    Documents have smooth surfaces vs textured backgrounds (fabric, wood, etc).
+    Uses local variance to create a smoothness map, then finds the largest smooth blob.
+    """
+    h, w = img_resized.shape[:2]
+    image_area = h * w
+    gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    # Calculate local variance using a sliding window
+    kernel_size = 15
+    mean = cv2.blur(gray, (kernel_size, kernel_size))
+    sqr_mean = cv2.blur(gray * gray, (kernel_size, kernel_size))
+    variance = sqr_mean - mean * mean
+    variance = np.clip(variance, 0, None)
+
+    # Threshold: low variance = smooth (document), high variance = textured (background)
+    # Normalize variance to 0-255
+    var_norm = cv2.normalize(variance, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    # Smooth regions have LOW variance → invert so smooth = white
+    smooth_map = cv2.bitwise_not(var_norm)
+
+    # Threshold to get binary smooth regions
+    _, binary = cv2.threshold(smooth_map, 180, 255, cv2.THRESH_BINARY)
+
+    # Clean up with morphological operations
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=3)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
+
+    # Find contours of smooth regions
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return None
+
+    # Find the largest smooth region that could be a document
+    best_rect = None
+    best_area = 0
+
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+        area = cv2.contourArea(contour)
+        if area < image_area * 0.08 or area > image_area * 0.80:
+            continue
+
+        x, y, bw, bh = cv2.boundingRect(contour)
+        aspect = max(bw, bh) / max(min(bw, bh), 1)
+
+        # Document aspect ratio check
+        if 1.1 < aspect < 3.0 and area > best_area:
+            best_area = area
+            best_rect = (x, y, bw, bh)
+
+    return best_rect
 
 
 def detect_and_crop_document(img, margin_pct=0.02):
@@ -470,7 +523,30 @@ def detect_and_crop_document(img, margin_pct=0.02):
     else:
         debug["text"] = "none_found"
 
-    # Strategy 3: Bounding rect fallback
+    # Strategy 3: Smoothness-based (documents are smooth vs textured backgrounds)
+    smooth_rect = find_document_by_smoothness(img_resized)
+
+    if smooth_rect is not None:
+        sx, sy, sw, sh = smooth_rect
+        debug["smooth"] = f"found|x={int(sx/scale)},y={int(sy/scale)},w={int(sw/scale)},h={int(sh/scale)}"
+
+        x = int(sx / scale)
+        y = int(sy / scale)
+        w = int(sw / scale)
+        h = int(sh / scale)
+
+        margin_x = int(width * margin_pct)
+        margin_y = int(height * margin_pct)
+        x = max(0, x - margin_x)
+        y = max(0, y - margin_y)
+        w = min(width - x, w + 2 * margin_x)
+        h = min(height - y, h + 2 * margin_y)
+
+        return original[y:y+h, x:x+w], True, "smooth", debug
+    else:
+        debug["smooth"] = "none_found"
+
+    # Strategy 4: Bounding rect fallback
     bounding = find_document_bounding_rect(img_resized)
 
     if bounding is not None:

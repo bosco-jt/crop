@@ -315,6 +315,74 @@ def find_document_bounding_rect(img_resized):
     return best_rect
 
 
+def find_document_by_text(img_resized, margin_pct=0.05):
+    """
+    Detect document area by finding text regions using MSER.
+    The bounding box of all text regions approximates the document area.
+    Works well even with textured backgrounds or hands holding the document.
+    
+    Returns (x, y, w, h) bounding rect or None.
+    """
+    h, w = img_resized.shape[:2]
+    image_area = h * w
+    gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
+
+    # Use MSER to detect text-like regions
+    mser = cv2.MSER_create()
+    mser.setMinArea(60)
+    mser.setMaxArea(int(image_area * 0.01))  # Text regions are small
+
+    regions, _ = mser.detectRegions(gray)
+
+    if len(regions) < 5:
+        # Not enough text regions found
+        return None
+
+    # Get bounding boxes for all detected regions
+    all_points = []
+    for region in regions:
+        x, y, rw, rh = cv2.boundingRect(region)
+        # Filter: text regions should be small and have reasonable aspect ratio
+        if rw > 5 and rh > 5 and rw < w * 0.5 and rh < h * 0.3:
+            all_points.append([x, y])
+            all_points.append([x + rw, y + rh])
+
+    if len(all_points) < 10:
+        return None
+
+    all_points = np.array(all_points)
+
+    # Get the bounding box of all text regions
+    min_x = np.min(all_points[:, 0])
+    min_y = np.min(all_points[:, 1])
+    max_x = np.max(all_points[:, 0])
+    max_y = np.max(all_points[:, 1])
+
+    text_w = max_x - min_x
+    text_h = max_y - min_y
+    text_area = text_w * text_h
+
+    # Text area should be between 10% and 80% of image
+    if text_area < image_area * 0.10 or text_area > image_area * 0.80:
+        return None
+
+    # Check aspect ratio is document-like (between 1.2 and 2.5)
+    aspect = max(text_w, text_h) / max(min(text_w, text_h), 1)
+    if aspect < 1.1 or aspect > 3.0:
+        return None
+
+    # Add margin around the text area (document extends beyond text)
+    margin_x = int(text_w * margin_pct)
+    margin_y = int(text_h * margin_pct)
+
+    x = max(0, min_x - margin_x)
+    y = max(0, min_y - margin_y)
+    bw = min(w - x, text_w + 2 * margin_x)
+    bh = min(h - y, text_h + 2 * margin_y)
+
+    return (x, y, bw, bh)
+
+
 def detect_and_crop_document(img, margin_pct=0.02):
     """Detect the document contour and crop it."""
     original = img.copy()
@@ -328,34 +396,60 @@ def detect_and_crop_document(img, margin_pct=0.02):
     else:
         img_resized = img.copy()
 
+    # Strategy 1: Try contour-based detection (best for documents on surfaces)
     doc_contour = find_document_contour(img_resized)
 
     if doc_contour is not None:
-        doc_contour = (doc_contour / scale).astype(int)
-        pts = doc_contour.reshape(4, 2)
-        rect = order_points(pts)
+        # Verify contour isn't too large (could be background)
+        contour_area = cv2.contourArea(doc_contour)
+        img_area = img_resized.shape[0] * img_resized.shape[1]
+
+        if contour_area < img_area * 0.75:
+            doc_contour_scaled = (doc_contour / scale).astype(int)
+            pts = doc_contour_scaled.reshape(4, 2)
+            rect = order_points(pts)
+
+            margin_x = int(width * margin_pct)
+            margin_y = int(height * margin_pct)
+            rect[0] = [max(0, rect[0][0] - margin_x), max(0, rect[0][1] - margin_y)]
+            rect[1] = [min(width, rect[1][0] + margin_x), max(0, rect[1][1] - margin_y)]
+            rect[2] = [min(width, rect[2][0] + margin_x), min(height, rect[2][1] + margin_y)]
+            rect[3] = [max(0, rect[3][0] - margin_x), min(height, rect[3][1] + margin_y)]
+
+            (tl, tr, br, bl) = rect
+
+            max_width = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
+            max_height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
+
+            dst = np.array([
+                [0, 0], [max_width - 1, 0],
+                [max_width - 1, max_height - 1], [0, max_height - 1]
+            ], dtype="float32")
+
+            matrix = cv2.getPerspectiveTransform(rect.astype("float32"), dst)
+            warped = cv2.warpPerspective(original, matrix, (max_width, max_height))
+            return warped, True
+
+    # Strategy 2: Text-based detection (handles hands, textured backgrounds)
+    text_rect = find_document_by_text(img_resized)
+
+    if text_rect is not None:
+        x, y, w, h = text_rect
+        x = int(x / scale)
+        y = int(y / scale)
+        w = int(w / scale)
+        h = int(h / scale)
 
         margin_x = int(width * margin_pct)
         margin_y = int(height * margin_pct)
-        rect[0] = [max(0, rect[0][0] - margin_x), max(0, rect[0][1] - margin_y)]
-        rect[1] = [min(width, rect[1][0] + margin_x), max(0, rect[1][1] - margin_y)]
-        rect[2] = [min(width, rect[2][0] + margin_x), min(height, rect[2][1] + margin_y)]
-        rect[3] = [max(0, rect[3][0] - margin_x), min(height, rect[3][1] + margin_y)]
+        x = max(0, x - margin_x)
+        y = max(0, y - margin_y)
+        w = min(width - x, w + 2 * margin_x)
+        h = min(height - y, h + 2 * margin_y)
 
-        (tl, tr, br, bl) = rect
+        return original[y:y+h, x:x+w], True
 
-        max_width = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
-        max_height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
-
-        dst = np.array([
-            [0, 0], [max_width - 1, 0],
-            [max_width - 1, max_height - 1], [0, max_height - 1]
-        ], dtype="float32")
-
-        matrix = cv2.getPerspectiveTransform(rect.astype("float32"), dst)
-        warped = cv2.warpPerspective(original, matrix, (max_width, max_height))
-        return warped, True
-
+    # Strategy 3: Bounding rect fallback
     bounding = find_document_bounding_rect(img_resized)
 
     if bounding is not None:

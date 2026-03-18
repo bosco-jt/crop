@@ -450,6 +450,7 @@ def find_document_by_smoothness(img_resized):
 def gemini_detect_document(img):
     """
     Use Gemini 2.5 Flash to detect document position using percentages.
+    Makes 2 attempts and picks the best result.
     Returns ((x, y, w, h) in pixels, info_str) or (None, error_str).
     """
     if not GEMINI_API_KEY:
@@ -461,46 +462,64 @@ def gemini_detect_document(img):
             return None, "encode_failed"
         img_b64 = base64.b64encode(buffer.tobytes()).decode("utf-8")
         img_h, img_w = img.shape[:2]
+        img_area = img_w * img_h
 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 
-        prompt = 'Find the rectangular document (ID card, credit card, passport or similar) in this photo. Return its position as PERCENTAGES (0 to 100) of the image dimensions. Return ONLY a JSON object: {"left": 0, "top": 0, "right": 100, "bottom": 100}. "left" = percentage from left edge where document starts. "top" = percentage from top where document starts. "right" = percentage from left where document ends. "bottom" = percentage from top where document ends. The bounding box should be as tight as possible to the document edges with only 1-2% extra margin. No markdown, no backticks, ONLY the JSON.'
+        prompt = 'Find the rectangular document (ID card, credit card, passport or similar) in this photo. Return its position as PERCENTAGES (0 to 100) of the image dimensions. Return ONLY a JSON object: {"left": 0, "top": 0, "right": 100, "bottom": 100}. "left" = percentage from left edge where document starts. "top" = percentage from top where document starts. "right" = percentage from left where document ends. "bottom" = percentage from top where document ends. Include the full document with 2% margin. No markdown, no backticks, ONLY the JSON.'
 
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}},
-                    {"text": prompt}
-                ]
-            }],
-            "generationConfig": {"temperature": 0, "maxOutputTokens": 1000}
-        }
+        candidates = []
 
-        resp = requests.post(url, json=payload, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
+        for attempt in range(2):
+            try:
+                payload = {
+                    "contents": [{
+                        "parts": [
+                            {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}},
+                            {"text": prompt}
+                        ]
+                    }],
+                    "generationConfig": {"temperature": 0.2 * attempt, "maxOutputTokens": 1000}
+                }
 
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        text = text.replace("```json", "").replace("```", "").strip()
-        coords = json.loads(text)
+                resp = requests.post(url, json=payload, timeout=20)
+                resp.raise_for_status()
+                data = resp.json()
 
-        left = float(coords["left"])
-        top = float(coords["top"])
-        right = float(coords["right"])
-        bottom = float(coords["bottom"])
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                text = text.replace("```json", "").replace("```", "").strip()
+                coords = json.loads(text)
 
-        # Convert percentages to pixels
-        x = int(img_w * left / 100)
-        y = int(img_h * top / 100)
-        w = int(img_w * (right - left) / 100)
-        h = int(img_h * (bottom - top) / 100)
+                left = float(coords["left"])
+                top = float(coords["top"])
+                right = float(coords["right"])
+                bottom = float(coords["bottom"])
 
-        info = f"pcts=L{left:.1f},T{top:.1f},R{right:.1f},B{bottom:.1f}|px=x{x},y{y},w{w},h{h}"
+                x = int(img_w * left / 100)
+                y = int(img_h * top / 100)
+                w = int(img_w * (right - left) / 100)
+                h = int(img_h * (bottom - top) / 100)
 
-        if w < 50 or h < 50:
-            return None, f"too_small|{info}"
+                if w > 50 and h > 50:
+                    crop_area = w * h
+                    aspect = max(w, h) / max(min(w, h), 1)
+                    # Document should be 10-80% of image with aspect 1.2-2.5
+                    if img_area * 0.10 < crop_area < img_area * 0.80 and 1.1 < aspect < 3.0:
+                        candidates.append({
+                            "rect": (x, y, w, h),
+                            "area": crop_area,
+                            "aspect": aspect,
+                            "info": f"pcts=L{left:.1f},T{top:.1f},R{right:.1f},B{bottom:.1f}|px=x{x},y{y},w{w},h{h}"
+                        })
+            except:
+                continue
 
-        return (x, y, w, h), info
+        if not candidates:
+            return None, "no_valid_candidates"
+
+        # Pick the candidate with the largest area (most likely to include full document)
+        best = max(candidates, key=lambda c: c["area"])
+        return best["rect"], f"attempts={len(candidates)}|{best['info']}"
 
     except Exception as e:
         return None, str(e)

@@ -464,7 +464,7 @@ def gemini_detect_document(img):
 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 
-        prompt = 'Find the rectangular document (ID card, credit card, passport or similar) in this photo. Return its position as PERCENTAGES (0 to 100) of the image dimensions. Return ONLY a JSON object: {"left": 0, "top": 0, "right": 100, "bottom": 100}. "left" = percentage from left edge where document starts. "top" = percentage from top where document starts. "right" = percentage from left where document ends. "bottom" = percentage from top where document ends. It is better to include extra background than to cut the document. No markdown, no backticks, ONLY the JSON.'
+        prompt = 'Find the rectangular document (ID card, credit card, passport or similar) in this photo. Return its position as PERCENTAGES (0 to 100) of the image dimensions. Return ONLY a JSON object: {"left": 0, "top": 0, "right": 100, "bottom": 100}. "left" = percentage from left edge where document starts. "top" = percentage from top where document starts. "right" = percentage from left where document ends. "bottom" = percentage from top where document ends. The bounding box should be as tight as possible to the document edges with only 1-2% extra margin. No markdown, no backticks, ONLY the JSON.'
 
         payload = {
             "contents": [{

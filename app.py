@@ -470,7 +470,7 @@ def find_document_by_gemini(img):
                     {"text": 'Look at this photo and find the rectangular document (ID card, credit card, passport or similar). Return the bounding box that fits tightly around the document edges. Return ONLY a valid JSON object: {"x": 0, "y": 0, "width": 0, "height": 0}. x and y are the top-left corner, width and height are the box dimensions, all in pixels. No markdown, no explanation, no backticks, ONLY the JSON.'}
                 ]
             }],
-            "generationConfig": {"temperature": 0, "maxOutputTokens": 100}
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 1000}
         }
 
         resp = requests.post(url, json=payload, timeout=15)

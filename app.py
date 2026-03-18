@@ -4,7 +4,6 @@ import numpy as np
 import requests
 import os
 import io
-import json
 
 app = Flask(__name__)
 
@@ -35,28 +34,16 @@ def order_points(pts):
 # ─── QUALITY SCORING ───────────────────────────────────────────────
 
 def score_sharpness(gray):
-    """
-    Measure image sharpness using Laplacian variance.
-    Higher variance = sharper image.
-    Returns 0-100 score.
-    """
+    """Measure image sharpness using Laplacian variance."""
     laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-    # Typical range: <50 very blurry, 50-200 acceptable, >200 sharp
     score = min(100, (laplacian_var / 300) * 100)
     return round(score)
 
 
 def score_lighting(gray):
-    """
-    Evaluate lighting quality based on brightness distribution.
-    Penalizes both overexposure and underexposure.
-    Returns 0-100 score.
-    """
+    """Evaluate lighting quality based on brightness distribution."""
     mean_brightness = np.mean(gray)
-    std_brightness = np.std(gray)
 
-    # Ideal mean brightness: around 120-140
-    # Penalize if too dark (<80) or too bright (>200)
     if mean_brightness < 40:
         brightness_score = 10
     elif mean_brightness < 80:
@@ -72,11 +59,9 @@ def score_lighting(gray):
     else:
         brightness_score = 15
 
-    # Check for overexposed/underexposed pixels
     overexposed = np.sum(gray > 245) / gray.size
     underexposed = np.sum(gray < 10) / gray.size
 
-    # Penalize if >15% of pixels are blown out or crushed
     exposure_penalty = 0
     if overexposed > 0.15:
         exposure_penalty += min(30, overexposed * 100)
@@ -88,15 +73,11 @@ def score_lighting(gray):
 
 
 def score_resolution(h, w):
-    """
-    Score based on image resolution.
-    For ID documents, minimum useful is ~400x250px.
-    Returns 0-100 score.
-    """
+    """Score based on image resolution."""
     pixels = h * w
-    min_pixels = 400 * 250  # 100,000 - minimum for readability
-    good_pixels = 800 * 500  # 400,000 - good quality
-    great_pixels = 1200 * 800  # 960,000 - excellent
+    min_pixels = 400 * 250
+    good_pixels = 800 * 500
+    great_pixels = 1200 * 800
 
     if pixels < min_pixels:
         score = max(5, (pixels / min_pixels) * 40)
@@ -111,31 +92,21 @@ def score_resolution(h, w):
 
 
 def score_contrast(gray):
-    """
-    Measure text legibility via local contrast.
-    Uses standard deviation and histogram spread.
-    Returns 0-100 score.
-    """
+    """Measure text legibility via local contrast."""
     std = np.std(gray)
-    # Good contrast for documents: std > 40
     contrast_score = min(100, (std / 60) * 100)
 
-    # Also check histogram spread (dynamic range)
     p5 = np.percentile(gray, 5)
     p95 = np.percentile(gray, 95)
     dynamic_range = p95 - p5
-    # Good range for documents: >100
     range_score = min(100, (dynamic_range / 150) * 100)
 
     score = (contrast_score * 0.6) + (range_score * 0.4)
     return round(score)
 
 
-def evaluate_quality(img):
-    """
-    Evaluate overall document image quality.
-    Returns dict with overall score (0-100) and individual scores.
-    """
+def evaluate_quality(img, detected=True):
+    """Evaluate overall document image quality."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = img.shape[:2]
 
@@ -144,13 +115,16 @@ def evaluate_quality(img):
     resolution = score_resolution(h, w)
     contrast = score_contrast(gray)
 
-    # Weighted average: sharpness and contrast matter most for document legibility
     overall = round(
         sharpness * 0.35 +
         contrast * 0.30 +
         lighting * 0.20 +
         resolution * 0.15
     )
+
+    # Penalize if document was not detected
+    if not detected:
+        overall = min(overall, 25)
 
     return {
         "overall": overall,
@@ -161,13 +135,92 @@ def evaluate_quality(img):
     }
 
 
+# ─── FACE DETECTION & CROP ────────────────────────────────────────
+
+def crop_face_portrait(img, margin_factor=0.4):
+    """
+    Detect face and crop to passport/ID photo format (35x45mm ratio).
+    
+    Args:
+        img: Input image (BGR)
+        margin_factor: How much extra space around the face (0.4 = 40%)
+    
+    Returns:
+        (cropped_image, detected_bool)
+    """
+    height, width = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+
+    # Load Haar Cascade for face detection
+    face_cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    face_cascade = cv2.CascadeClassifier(face_cascade_path)
+
+    # Detect faces at multiple scales
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(50, 50),
+        flags=cv2.CASCADE_SCALE_IMAGE
+    )
+
+    if len(faces) == 0:
+        # Try with more relaxed parameters
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.05,
+            minNeighbors=3,
+            minSize=(30, 30)
+        )
+
+    if len(faces) == 0:
+        return img, False
+
+    # Take the largest face
+    faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+    fx, fy, fw, fh = faces[0]
+
+    # Calculate passport photo crop (35x45mm ratio = 7:9)
+    target_ratio = 7.0 / 9.0  # width / height
+
+    # Face should be about 70% of the frame height
+    crop_h = int(fh / 0.70)
+    crop_w = int(crop_h * target_ratio)
+
+    # Center horizontally on face
+    face_center_x = fx + fw // 2
+    crop_x = face_center_x - crop_w // 2
+
+    # Position vertically: face starts at about 20% from top
+    crop_y = fy - int(crop_h * 0.20)
+
+    # Clamp to image bounds
+    crop_x = max(0, crop_x)
+    crop_y = max(0, crop_y)
+
+    # Adjust if crop goes beyond image
+    if crop_x + crop_w > width:
+        crop_x = max(0, width - crop_w)
+        crop_w = min(crop_w, width - crop_x)
+
+    if crop_y + crop_h > height:
+        crop_y = max(0, height - crop_h)
+        crop_h = min(crop_h, height - crop_y)
+
+    cropped = img[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+
+    # Resize to standard passport size (350x450 px)
+    if cropped.shape[0] > 0 and cropped.shape[1] > 0:
+        cropped = cv2.resize(cropped, (350, 450), interpolation=cv2.INTER_LANCZOS4)
+
+    return cropped, True
+
+
 # ─── DOCUMENT DETECTION ───────────────────────────────────────────
 
 def find_document_contour(img_resized):
-    """
-    Try multiple strategies to find the document contour.
-    Returns the best 4-point contour found, or None.
-    """
+    """Try multiple strategies to find the document contour."""
     h, w = img_resized.shape[:2]
     image_area = h * w
     best_contour = None
@@ -263,10 +316,7 @@ def find_document_bounding_rect(img_resized):
 
 
 def detect_and_crop_document(img, margin_pct=0.02):
-    """
-    Detect the document contour in the image and crop it.
-    Uses multiple strategies to handle both dark and light backgrounds.
-    """
+    """Detect the document contour and crop it."""
     original = img.copy()
     height, width = img.shape[:2]
 
@@ -324,6 +374,7 @@ def detect_and_crop_document(img, margin_pct=0.02):
 
         return original[y:y+h, x:x+w], True
 
+    # Nothing detected: return original
     return original, False
 
 
@@ -337,21 +388,22 @@ def health():
 @app.route("/crop", methods=["POST"])
 def crop():
     """
-    Crop a document from an image and return quality score in headers.
+    Crop a document or face from an image.
 
-    JSON body: { "image_url": "https://...", "margin": 0.03 }
+    JSON body:
+    {
+        "image_url": "https://...",
+        "margin": 0.03,
+        "type": "foto"  // "foto" = face crop, anything else = document crop
+    }
+
     Or binary image data with Content-Type: image/*
 
-    Returns: cropped image as PNG with quality headers:
-      X-Quality-Overall: 0-100
-      X-Quality-Sharpness: 0-100
-      X-Quality-Lighting: 0-100
-      X-Quality-Resolution: 0-100
-      X-Quality-Contrast: 0-100
-      X-Document-Detected: true/false
+    Returns: cropped image as PNG with quality headers
     """
     try:
         content_type = request.content_type or ""
+        img_type = "document"
 
         if "application/json" in content_type:
             data = request.get_json(silent=True)
@@ -359,6 +411,7 @@ def crop():
                 return {"error": "image_url is required"}, 400
             img = download_image(data["image_url"])
             margin_pct = float(data.get("margin", 0.02))
+            img_type = data.get("type", "document")
 
         elif "image/" in content_type or "application/octet-stream" in content_type:
             img_array = np.frombuffer(request.data, dtype=np.uint8)
@@ -369,18 +422,20 @@ def crop():
         else:
             return {"error": "Send JSON with image_url or binary image data"}, 400
 
-        # Crop
-        cropped, detected = detect_and_crop_document(img, margin_pct)
+        # Route based on type
+        if img_type == "foto":
+            cropped, detected = crop_face_portrait(img)
+        else:
+            cropped, detected = detect_and_crop_document(img, margin_pct)
 
-        # Evaluate quality on the cropped image
-        quality = evaluate_quality(cropped)
+        # Evaluate quality
+        quality = evaluate_quality(cropped, detected)
 
         # Encode as PNG
         success, buffer = cv2.imencode(".png", cropped)
         if not success:
             return {"error": "Failed to encode cropped image"}, 500
 
-        # Return image with quality scores in headers
         response = Response(
             buffer.tobytes(),
             mimetype="image/png",
@@ -392,7 +447,8 @@ def crop():
                 "X-Quality-Resolution": str(quality["resolution"]),
                 "X-Quality-Contrast": str(quality["contrast"]),
                 "X-Document-Detected": str(detected).lower(),
-                "Access-Control-Expose-Headers": "X-Quality-Overall, X-Quality-Sharpness, X-Quality-Lighting, X-Quality-Resolution, X-Quality-Contrast, X-Document-Detected"
+                "X-Crop-Type": img_type,
+                "Access-Control-Expose-Headers": "X-Quality-Overall, X-Quality-Sharpness, X-Quality-Lighting, X-Quality-Resolution, X-Quality-Contrast, X-Document-Detected, X-Crop-Type"
             }
         )
         return response

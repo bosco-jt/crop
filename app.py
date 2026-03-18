@@ -1,9 +1,10 @@
-from flask import Flask, request, send_file
+from flask import Flask, request, Response
 import cv2
 import numpy as np
 import requests
 import os
 import io
+import json
 
 app = Flask(__name__)
 
@@ -31,6 +32,137 @@ def order_points(pts):
     return rect
 
 
+# ─── QUALITY SCORING ───────────────────────────────────────────────
+
+def score_sharpness(gray):
+    """
+    Measure image sharpness using Laplacian variance.
+    Higher variance = sharper image.
+    Returns 0-100 score.
+    """
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    # Typical range: <50 very blurry, 50-200 acceptable, >200 sharp
+    score = min(100, (laplacian_var / 300) * 100)
+    return round(score)
+
+
+def score_lighting(gray):
+    """
+    Evaluate lighting quality based on brightness distribution.
+    Penalizes both overexposure and underexposure.
+    Returns 0-100 score.
+    """
+    mean_brightness = np.mean(gray)
+    std_brightness = np.std(gray)
+
+    # Ideal mean brightness: around 120-140
+    # Penalize if too dark (<80) or too bright (>200)
+    if mean_brightness < 40:
+        brightness_score = 10
+    elif mean_brightness < 80:
+        brightness_score = 30 + (mean_brightness - 40) * (40 / 40)
+    elif mean_brightness < 120:
+        brightness_score = 70 + (mean_brightness - 80) * (30 / 40)
+    elif mean_brightness <= 160:
+        brightness_score = 100
+    elif mean_brightness <= 200:
+        brightness_score = 100 - (mean_brightness - 160) * (30 / 40)
+    elif mean_brightness <= 230:
+        brightness_score = 70 - (mean_brightness - 200) * (40 / 30)
+    else:
+        brightness_score = 15
+
+    # Check for overexposed/underexposed pixels
+    overexposed = np.sum(gray > 245) / gray.size
+    underexposed = np.sum(gray < 10) / gray.size
+
+    # Penalize if >15% of pixels are blown out or crushed
+    exposure_penalty = 0
+    if overexposed > 0.15:
+        exposure_penalty += min(30, overexposed * 100)
+    if underexposed > 0.15:
+        exposure_penalty += min(30, underexposed * 100)
+
+    score = max(0, min(100, brightness_score - exposure_penalty))
+    return round(score)
+
+
+def score_resolution(h, w):
+    """
+    Score based on image resolution.
+    For ID documents, minimum useful is ~400x250px.
+    Returns 0-100 score.
+    """
+    pixels = h * w
+    min_pixels = 400 * 250  # 100,000 - minimum for readability
+    good_pixels = 800 * 500  # 400,000 - good quality
+    great_pixels = 1200 * 800  # 960,000 - excellent
+
+    if pixels < min_pixels:
+        score = max(5, (pixels / min_pixels) * 40)
+    elif pixels < good_pixels:
+        score = 40 + ((pixels - min_pixels) / (good_pixels - min_pixels)) * 30
+    elif pixels < great_pixels:
+        score = 70 + ((pixels - good_pixels) / (great_pixels - good_pixels)) * 30
+    else:
+        score = 100
+
+    return round(score)
+
+
+def score_contrast(gray):
+    """
+    Measure text legibility via local contrast.
+    Uses standard deviation and histogram spread.
+    Returns 0-100 score.
+    """
+    std = np.std(gray)
+    # Good contrast for documents: std > 40
+    contrast_score = min(100, (std / 60) * 100)
+
+    # Also check histogram spread (dynamic range)
+    p5 = np.percentile(gray, 5)
+    p95 = np.percentile(gray, 95)
+    dynamic_range = p95 - p5
+    # Good range for documents: >100
+    range_score = min(100, (dynamic_range / 150) * 100)
+
+    score = (contrast_score * 0.6) + (range_score * 0.4)
+    return round(score)
+
+
+def evaluate_quality(img):
+    """
+    Evaluate overall document image quality.
+    Returns dict with overall score (0-100) and individual scores.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = img.shape[:2]
+
+    sharpness = score_sharpness(gray)
+    lighting = score_lighting(gray)
+    resolution = score_resolution(h, w)
+    contrast = score_contrast(gray)
+
+    # Weighted average: sharpness and contrast matter most for document legibility
+    overall = round(
+        sharpness * 0.35 +
+        contrast * 0.30 +
+        lighting * 0.20 +
+        resolution * 0.15
+    )
+
+    return {
+        "overall": overall,
+        "sharpness": sharpness,
+        "lighting": lighting,
+        "resolution": resolution,
+        "contrast": contrast
+    }
+
+
+# ─── DOCUMENT DETECTION ───────────────────────────────────────────
+
 def find_document_contour(img_resized):
     """
     Try multiple strategies to find the document contour.
@@ -48,18 +180,12 @@ def find_document_contour(img_resized):
     sat = cv2.GaussianBlur(hsv[:, :, 1], (5, 5), 0)
 
     strategies = [
-        # 1: Standard Canny (works with dark backgrounds)
         cv2.Canny(blurred, 30, 200),
-        # 2: Adaptive threshold (works with low contrast / light backgrounds)
         cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                               cv2.THRESH_BINARY_INV, 11, 2),
-        # 3: Low threshold Canny (catches subtle edges)
         cv2.Canny(blurred, 10, 80),
-        # 4: Saturation channel (documents have different saturation than background)
         cv2.Canny(sat, 20, 100),
-        # 5: Otsu threshold
         cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1],
-        # 6: Morphological gradient
         cv2.threshold(
             cv2.morphologyEx(gray_filtered, cv2.MORPH_GRADIENT,
                              cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))),
@@ -144,7 +270,6 @@ def detect_and_crop_document(img, margin_pct=0.02):
     original = img.copy()
     height, width = img.shape[:2]
 
-    # Resize for faster processing
     scale = 1.0
     max_dim = 1000
     if max(height, width) > max_dim:
@@ -153,7 +278,6 @@ def detect_and_crop_document(img, margin_pct=0.02):
     else:
         img_resized = img.copy()
 
-    # Try to find a 4-corner document contour
     doc_contour = find_document_contour(img_resized)
 
     if doc_contour is not None:
@@ -161,7 +285,6 @@ def detect_and_crop_document(img, margin_pct=0.02):
         pts = doc_contour.reshape(4, 2)
         rect = order_points(pts)
 
-        # Expand by margin
         margin_x = int(width * margin_pct)
         margin_y = int(height * margin_pct)
         rect[0] = [max(0, rect[0][0] - margin_x), max(0, rect[0][1] - margin_y)]
@@ -183,7 +306,6 @@ def detect_and_crop_document(img, margin_pct=0.02):
         warped = cv2.warpPerspective(original, matrix, (max_width, max_height))
         return warped, True
 
-    # Fallback: bounding rectangle
     bounding = find_document_bounding_rect(img_resized)
 
     if bounding is not None:
@@ -205,6 +327,8 @@ def detect_and_crop_document(img, margin_pct=0.02):
     return original, False
 
 
+# ─── ROUTES ────────────────────────────────────────────────────────
+
 @app.route("/", methods=["GET"])
 def health():
     return {"status": "ok", "service": "document-crop"}
@@ -213,10 +337,18 @@ def health():
 @app.route("/crop", methods=["POST"])
 def crop():
     """
-    Crop a document from an image.
+    Crop a document from an image and return quality score in headers.
+
     JSON body: { "image_url": "https://...", "margin": 0.03 }
     Or binary image data with Content-Type: image/*
-    Returns: cropped image as PNG
+
+    Returns: cropped image as PNG with quality headers:
+      X-Quality-Overall: 0-100
+      X-Quality-Sharpness: 0-100
+      X-Quality-Lighting: 0-100
+      X-Quality-Resolution: 0-100
+      X-Quality-Contrast: 0-100
+      X-Document-Detected: true/false
     """
     try:
         content_type = request.content_type or ""
@@ -237,17 +369,33 @@ def crop():
         else:
             return {"error": "Send JSON with image_url or binary image data"}, 400
 
+        # Crop
         cropped, detected = detect_and_crop_document(img, margin_pct)
 
+        # Evaluate quality on the cropped image
+        quality = evaluate_quality(cropped)
+
+        # Encode as PNG
         success, buffer = cv2.imencode(".png", cropped)
         if not success:
             return {"error": "Failed to encode cropped image"}, 500
 
-        return send_file(
-            io.BytesIO(buffer.tobytes()),
+        # Return image with quality scores in headers
+        response = Response(
+            buffer.tobytes(),
             mimetype="image/png",
-            download_name="cropped.png"
+            headers={
+                "Content-Disposition": "attachment; filename=cropped.png",
+                "X-Quality-Overall": str(quality["overall"]),
+                "X-Quality-Sharpness": str(quality["sharpness"]),
+                "X-Quality-Lighting": str(quality["lighting"]),
+                "X-Quality-Resolution": str(quality["resolution"]),
+                "X-Quality-Contrast": str(quality["contrast"]),
+                "X-Document-Detected": str(detected).lower(),
+                "Access-Control-Expose-Headers": "X-Quality-Overall, X-Quality-Sharpness, X-Quality-Lighting, X-Quality-Resolution, X-Quality-Contrast, X-Document-Detected"
+            }
         )
+        return response
 
     except requests.exceptions.RequestException as e:
         return {"error": f"Failed to download image: {str(e)}"}, 400

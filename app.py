@@ -264,7 +264,7 @@ def find_document_contour(img_resized):
 
             if len(approx) == 4:
                 contour_area = cv2.contourArea(approx)
-                if image_area * 0.10 < contour_area < image_area * 0.95:
+                if image_area * 0.10 < contour_area < image_area * 0.80:
                     x, y, bw, bh = cv2.boundingRect(approx)
                     aspect = max(bw, bh) / max(min(bw, bh), 1)
                     if 1.1 < aspect < 3.0 and contour_area > best_area:
@@ -305,7 +305,7 @@ def find_document_bounding_rect(img_resized):
 
         for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
             area = cv2.contourArea(contour)
-            if image_area * 0.10 < area < image_area * 0.95:
+            if image_area * 0.10 < area < image_area * 0.80:
                 x, y, bw, bh = cv2.boundingRect(contour)
                 aspect = max(bw, bh) / max(min(bw, bh), 1)
                 if 1.1 < aspect < 3.0 and area > best_area:

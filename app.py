@@ -2,7 +2,6 @@ from flask import Flask, request, send_file
 import cv2
 import numpy as np
 import requests
-import tempfile
 import os
 import io
 
@@ -32,11 +31,115 @@ def order_points(pts):
     return rect
 
 
+def find_document_contour(img_resized):
+    """
+    Try multiple strategies to find the document contour.
+    Returns the best 4-point contour found, or None.
+    """
+    h, w = img_resized.shape[:2]
+    image_area = h * w
+    best_contour = None
+    best_area = 0
+
+    gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
+    gray_filtered = cv2.bilateralFilter(gray, 11, 17, 17)
+    blurred = cv2.GaussianBlur(gray_filtered, (5, 5), 0)
+    hsv = cv2.cvtColor(img_resized, cv2.COLOR_BGR2HSV)
+    sat = cv2.GaussianBlur(hsv[:, :, 1], (5, 5), 0)
+
+    strategies = [
+        # 1: Standard Canny (works with dark backgrounds)
+        cv2.Canny(blurred, 30, 200),
+        # 2: Adaptive threshold (works with low contrast / light backgrounds)
+        cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                              cv2.THRESH_BINARY_INV, 11, 2),
+        # 3: Low threshold Canny (catches subtle edges)
+        cv2.Canny(blurred, 10, 80),
+        # 4: Saturation channel (documents have different saturation than background)
+        cv2.Canny(sat, 20, 100),
+        # 5: Otsu threshold
+        cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1],
+        # 6: Morphological gradient
+        cv2.threshold(
+            cv2.morphologyEx(gray_filtered, cv2.MORPH_GRADIENT,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))),
+            15, 255, cv2.THRESH_BINARY)[1],
+    ]
+
+    for edged in strategies:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        dilated = cv2.dilate(edged, kernel, iterations=2)
+        closed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE,
+                                   cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
+                                   iterations=2)
+
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+        for contour in contours[:10]:
+            peri = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+
+            if len(approx) == 4:
+                contour_area = cv2.contourArea(approx)
+                if image_area * 0.10 < contour_area < image_area * 0.95:
+                    x, y, bw, bh = cv2.boundingRect(approx)
+                    aspect = max(bw, bh) / max(min(bw, bh), 1)
+                    if 1.1 < aspect < 3.0 and contour_area > best_area:
+                        best_area = contour_area
+                        best_contour = approx
+
+    return best_contour
+
+
+def find_document_bounding_rect(img_resized):
+    """Fallback: find the largest reasonable bounding rectangle."""
+    h, w = img_resized.shape[:2]
+    image_area = h * w
+    best_rect = None
+    best_area = 0
+
+    gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    hsv = cv2.cvtColor(img_resized, cv2.COLOR_BGR2HSV)
+    sat = cv2.GaussianBlur(hsv[:, :, 1], (5, 5), 0)
+
+    edges_list = [
+        cv2.Canny(blurred, 30, 200),
+        cv2.Canny(blurred, 10, 80),
+        cv2.Canny(sat, 20, 100),
+    ]
+
+    for edged in edges_list:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        dilated = cv2.dilate(edged, kernel, iterations=3)
+        closed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE,
+                                   cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)),
+                                   iterations=3)
+
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+            area = cv2.contourArea(contour)
+            if image_area * 0.10 < area < image_area * 0.95:
+                x, y, bw, bh = cv2.boundingRect(contour)
+                aspect = max(bw, bh) / max(min(bw, bh), 1)
+                if 1.1 < aspect < 3.0 and area > best_area:
+                    best_area = area
+                    best_rect = (x, y, bw, bh)
+
+    return best_rect
+
+
 def detect_and_crop_document(img, margin_pct=0.02):
     """
     Detect the document contour in the image and crop it.
-    margin_pct: percentage of image to add as margin around document (default 2%)
-    Returns cropped image or original if no document detected.
+    Uses multiple strategies to handle both dark and light backgrounds.
     """
     original = img.copy()
     height, width = img.shape[:2]
@@ -50,93 +153,56 @@ def detect_and_crop_document(img, margin_pct=0.02):
     else:
         img_resized = img.copy()
 
-    # Grayscale + bilateral filter + blur
-    gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, 11, 17, 17)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    # Try to find a 4-corner document contour
+    doc_contour = find_document_contour(img_resized)
 
-    # Edge detection
-    edged = cv2.Canny(blurred, 30, 200)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    edged = cv2.dilate(edged, kernel, iterations=2)
+    if doc_contour is not None:
+        doc_contour = (doc_contour / scale).astype(int)
+        pts = doc_contour.reshape(4, 2)
+        rect = order_points(pts)
 
-    # Find contours
-    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Expand by margin
+        margin_x = int(width * margin_pct)
+        margin_y = int(height * margin_pct)
+        rect[0] = [max(0, rect[0][0] - margin_x), max(0, rect[0][1] - margin_y)]
+        rect[1] = [min(width, rect[1][0] + margin_x), max(0, rect[1][1] - margin_y)]
+        rect[2] = [min(width, rect[2][0] + margin_x), min(height, rect[2][1] + margin_y)]
+        rect[3] = [max(0, rect[3][0] - margin_x), min(height, rect[3][1] + margin_y)]
 
-    if not contours:
-        return original, False
+        (tl, tr, br, bl) = rect
 
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+        max_width = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
+        max_height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
 
-    doc_contour = None
-    for contour in contours[:10]:
-        peri = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
-        if len(approx) == 4:
-            contour_area = cv2.contourArea(approx)
-            image_area = img_resized.shape[0] * img_resized.shape[1]
-            if contour_area > image_area * 0.10:
-                doc_contour = approx
-                break
+        dst = np.array([
+            [0, 0], [max_width - 1, 0],
+            [max_width - 1, max_height - 1], [0, max_height - 1]
+        ], dtype="float32")
 
-    if doc_contour is None:
-        # Fallback: bounding rect of largest contour
-        largest = contours[0]
-        contour_area = cv2.contourArea(largest)
-        image_area = img_resized.shape[0] * img_resized.shape[1]
+        matrix = cv2.getPerspectiveTransform(rect.astype("float32"), dst)
+        warped = cv2.warpPerspective(original, matrix, (max_width, max_height))
+        return warped, True
 
-        if contour_area < image_area * 0.10:
-            return original, False
+    # Fallback: bounding rectangle
+    bounding = find_document_bounding_rect(img_resized)
 
-        x, y, w, h = cv2.boundingRect(largest)
+    if bounding is not None:
+        x, y, w, h = bounding
         x = int(x / scale)
         y = int(y / scale)
         w = int(w / scale)
         h = int(h / scale)
 
-        # Small margin
-        margin = 5
-        x = max(0, x - margin)
-        y = max(0, y - margin)
-        w = min(width - x, w + 2 * margin)
-        h = min(height - y, h + 2 * margin)
+        margin_x = int(width * margin_pct)
+        margin_y = int(height * margin_pct)
+        x = max(0, x - margin_x)
+        y = max(0, y - margin_y)
+        w = min(width - x, w + 2 * margin_x)
+        h = min(height - y, h + 2 * margin_y)
 
         return original[y:y+h, x:x+w], True
 
-    # Scale contour back to original dimensions
-    doc_contour = (doc_contour / scale).astype(int)
-    pts = doc_contour.reshape(4, 2)
-    rect = order_points(pts)
-
-    # Expand rectangle outward by margin
-    margin_x = int(width * margin_pct)
-    margin_y = int(height * margin_pct)
-    rect[0] = [max(0, rect[0][0] - margin_x), max(0, rect[0][1] - margin_y)]
-    rect[1] = [min(width, rect[1][0] + margin_x), max(0, rect[1][1] - margin_y)]
-    rect[2] = [min(width, rect[2][0] + margin_x), min(height, rect[2][1] + margin_y)]
-    rect[3] = [max(0, rect[3][0] - margin_x), min(height, rect[3][1] + margin_y)]
-
-    (tl, tr, br, bl) = rect
-
-    width_a = np.linalg.norm(br - bl)
-    width_b = np.linalg.norm(tr - tl)
-    max_width = int(max(width_a, width_b))
-
-    height_a = np.linalg.norm(tr - br)
-    height_b = np.linalg.norm(tl - bl)
-    max_height = int(max(height_a, height_b))
-
-    dst = np.array([
-        [0, 0],
-        [max_width - 1, 0],
-        [max_width - 1, max_height - 1],
-        [0, max_height - 1]
-    ], dtype="float32")
-
-    matrix = cv2.getPerspectiveTransform(rect.astype("float32"), dst)
-    warped = cv2.warpPerspective(original, matrix, (max_width, max_height))
-
-    return warped, True
+    return original, False
 
 
 @app.route("/", methods=["GET"])
@@ -148,13 +214,9 @@ def health():
 def crop():
     """
     Crop a document from an image.
-    
-    Accepts JSON body:
-    { "image_url": "https://..." }
-    
-    Or binary image data in the request body with Content-Type: image/*
-    
-    Returns: cropped image as PNG binary
+    JSON body: { "image_url": "https://...", "margin": 0.03 }
+    Or binary image data with Content-Type: image/*
+    Returns: cropped image as PNG
     """
     try:
         content_type = request.content_type or ""
@@ -164,7 +226,7 @@ def crop():
             if not data or "image_url" not in data:
                 return {"error": "image_url is required"}, 400
             img = download_image(data["image_url"])
-            margin_pct = data.get("margin", 0.02)
+            margin_pct = float(data.get("margin", 0.02))
 
         elif "image/" in content_type or "application/octet-stream" in content_type:
             img_array = np.frombuffer(request.data, dtype=np.uint8)
@@ -175,10 +237,8 @@ def crop():
         else:
             return {"error": "Send JSON with image_url or binary image data"}, 400
 
-        # Crop
         cropped, detected = detect_and_crop_document(img, margin_pct)
 
-        # Encode as PNG
         success, buffer = cv2.imencode(".png", cropped)
         if not success:
             return {"error": "Failed to encode cropped image"}, 500

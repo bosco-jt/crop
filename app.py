@@ -488,10 +488,32 @@ def find_document_by_gemini(img):
         y = int(coords["y"])
         w = int(coords["width"])
         h = int(coords["height"])
+
         if x < 0 or y < 0 or w < 50 or h < 50:
             return None, f"invalid_coords|x={x},y={y},w={w},h={h}"
         if x + w > img_w * 1.1 or y + h > img_h * 1.1:
             return None, f"out_of_bounds|x={x},y={y},w={w},h={h}|img={img_w}x{img_h}"
+
+        # Check if Gemini returned coordinates at wrong scale
+        # If the detected area is too small (<15% of image), Gemini likely
+        # returned coords for a resized version of the image
+        crop_area = w * h
+        img_area = img_w * img_h
+        if crop_area < img_area * 0.15:
+            # Try to detect the scale factor by checking common Gemini internal sizes
+            # Gemini often works at 1024 or 768 max dimension
+            for ref_dim in [1024, 768, 512]:
+                if max(img_w, img_h) > ref_dim:
+                    scale_factor = max(img_w, img_h) / ref_dim
+                    sx = int(x * scale_factor)
+                    sy = int(y * scale_factor)
+                    sw = int(w * scale_factor)
+                    sh = int(h * scale_factor)
+                    scaled_area = sw * sh
+                    if img_area * 0.15 < scaled_area < img_area * 0.85:
+                        return (sx, sy, sw, sh), f"scaled|factor={scale_factor:.2f}"
+            # If no scale works, return the raw coords anyway
+            return (x, y, w, h), f"small_area|{crop_area/img_area*100:.1f}%"
 
         return (x, y, w, h), None
 

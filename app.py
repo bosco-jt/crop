@@ -265,7 +265,7 @@ def detect_coordinates(img, margin_pct=0.02):
     # Strategy 1: White background detection
     white_pixels = np.sum(gray > 240) / gray.size
     if white_pixels > 0.15:
-        _, binary = cv2.threshold(gray, 235, 255, cv2.THRESH_BINARY_INV)
+        _, binary = cv2.threshold(gray, 210, 255, cv2.THRESH_BINARY_INV)
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=3)
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)

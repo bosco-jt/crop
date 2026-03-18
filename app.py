@@ -4,8 +4,12 @@ import numpy as np
 import requests
 import os
 import io
+import json
+import base64
 
 app = Flask(__name__)
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 
 def download_image(url):
@@ -443,6 +447,62 @@ def find_document_by_smoothness(img_resized):
     return best_rect
 
 
+def find_document_by_gemini(img):
+    """
+    Use Gemini Flash to detect document bounding box.
+    Fallback when OpenCV strategies fail.
+    Returns (x, y, w, h) in original image pixels or None.
+    """
+    if not GEMINI_API_KEY:
+        return None
+
+    try:
+        # Encode image to base64
+        success, buffer = cv2.imencode(".jpeg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not success:
+            return None
+        img_b64 = base64.b64encode(buffer.tobytes()).decode("utf-8")
+
+        # Call Gemini API
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}},
+                    {"text": 'Look at this photo and find the rectangular document (ID card, credit card, passport or similar). Return the bounding box that fits tightly around the document edges. Return ONLY a valid JSON object: {"x": 0, "y": 0, "width": 0, "height": 0}. x and y are the top-left corner, width and height are the box dimensions, all in pixels. No markdown, no explanation, no backticks, ONLY the JSON.'}
+                ]
+            }],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 100}
+        }
+
+        resp = requests.post(url, json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        text = text.replace("```json", "").replace("```", "").strip()
+        coords = json.loads(text)
+
+        x = int(coords["x"])
+        y = int(coords["y"])
+        w = int(coords["width"])
+        h = int(coords["height"])
+
+        # Basic validation
+        img_h, img_w = img.shape[:2]
+        if x < 0 or y < 0 or w < 50 or h < 50:
+            return None
+        if x + w > img_w * 1.1 or y + h > img_h * 1.1:
+            return None
+
+        return (x, y, w, h)
+
+    except Exception as e:
+        print(f"Gemini fallback error: {e}")
+        return None
+
+
 def detect_and_crop_document(img, margin_pct=0.02):
     """Detect the document contour and crop it. Returns (image, detected, strategy, debug)."""
     original = img.copy()
@@ -546,7 +606,26 @@ def detect_and_crop_document(img, margin_pct=0.02):
     else:
         debug["smooth"] = "none_found"
 
-    # Strategy 4: Bounding rect fallback
+    # Strategy 4: Gemini AI fallback (handles complex backgrounds)
+    gemini_rect = find_document_by_gemini(original)
+
+    if gemini_rect is not None:
+        gx, gy, gw, gh = gemini_rect
+        debug["gemini"] = f"found|x={gx},y={gy},w={gw},h={gh}"
+
+        # Apply margin
+        margin_x = int(width * margin_pct)
+        margin_y = int(height * margin_pct)
+        x = max(0, gx - margin_x)
+        y = max(0, gy - margin_y)
+        w = min(width - x, gw + 2 * margin_x)
+        h = min(height - y, gh + 2 * margin_y)
+
+        return original[y:y+h, x:x+w], True, "gemini", debug
+    else:
+        debug["gemini"] = "none_found"
+
+    # Strategy 5: Bounding rect fallback
     bounding = find_document_bounding_rect(img_resized)
 
     if bounding is not None:

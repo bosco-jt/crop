@@ -32,9 +32,10 @@ def order_points(pts):
     return rect
 
 
-def detect_and_crop_document(img):
+def detect_and_crop_document(img, margin_pct=0.02):
     """
     Detect the document contour in the image and crop it.
+    margin_pct: percentage of image to add as margin around document (default 2%)
     Returns cropped image or original if no document detected.
     """
     original = img.copy()
@@ -107,6 +108,14 @@ def detect_and_crop_document(img):
     pts = doc_contour.reshape(4, 2)
     rect = order_points(pts)
 
+    # Expand rectangle outward by margin
+    margin_x = int(width * margin_pct)
+    margin_y = int(height * margin_pct)
+    rect[0] = [max(0, rect[0][0] - margin_x), max(0, rect[0][1] - margin_y)]
+    rect[1] = [min(width, rect[1][0] + margin_x), max(0, rect[1][1] - margin_y)]
+    rect[2] = [min(width, rect[2][0] + margin_x), min(height, rect[2][1] + margin_y)]
+    rect[3] = [max(0, rect[3][0] - margin_x), min(height, rect[3][1] + margin_y)]
+
     (tl, tr, br, bl) = rect
 
     width_a = np.linalg.norm(br - bl)
@@ -155,17 +164,19 @@ def crop():
             if not data or "image_url" not in data:
                 return {"error": "image_url is required"}, 400
             img = download_image(data["image_url"])
+            margin_pct = data.get("margin", 0.02)
 
         elif "image/" in content_type or "application/octet-stream" in content_type:
             img_array = np.frombuffer(request.data, dtype=np.uint8)
             img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
             if img is None:
                 return {"error": "Could not decode image from body"}, 400
+            margin_pct = 0.02
         else:
             return {"error": "Send JSON with image_url or binary image data"}, 400
 
         # Crop
-        cropped, detected = detect_and_crop_document(img)
+        cropped, detected = detect_and_crop_document(img, margin_pct)
 
         # Encode as PNG
         success, buffer = cv2.imencode(".png", cropped)

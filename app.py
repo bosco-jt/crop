@@ -391,9 +391,10 @@ def find_document_by_text(img_resized, margin_pct=0.05):
 
 
 def detect_and_crop_document(img, margin_pct=0.02):
-    """Detect the document contour and crop it. Returns (image, detected, strategy)."""
+    """Detect the document contour and crop it. Returns (image, detected, strategy, debug)."""
     original = img.copy()
     height, width = img.shape[:2]
+    debug = {"image_size": f"{width}x{height}"}
 
     scale = 1.0
     max_dim = 1000
@@ -404,12 +405,17 @@ def detect_and_crop_document(img, margin_pct=0.02):
         img_resized = img.copy()
 
     img_area = img_resized.shape[0] * img_resized.shape[1]
+    debug["scale"] = round(scale, 3)
 
-    # Strategy 1: Contour-based (best for documents on clean surfaces)
+    # Strategy 1: Contour-based
     doc_contour = find_document_contour(img_resized)
 
     if doc_contour is not None:
         contour_area = cv2.contourArea(doc_contour)
+        area_pct = round(contour_area / img_area * 100, 1)
+        pts_scaled = (doc_contour / scale).astype(int).reshape(4, 2).tolist()
+        debug["contour"] = f"found|area={area_pct}%|pts={pts_scaled}"
+
         if contour_area < img_area * 0.70:
             doc_contour_scaled = (doc_contour / scale).astype(int)
             pts = doc_contour_scaled.reshape(4, 2)
@@ -434,17 +440,23 @@ def detect_and_crop_document(img, margin_pct=0.02):
 
             matrix = cv2.getPerspectiveTransform(rect.astype("float32"), dst)
             warped = cv2.warpPerspective(original, matrix, (max_width, max_height))
-            return warped, True, "contour"
+            return warped, True, "contour", debug
+        else:
+            debug["contour"] += "|REJECTED:too_large"
+    else:
+        debug["contour"] = "none_found"
 
-    # Strategy 2: Text-based detection (handles hands, textured backgrounds)
+    # Strategy 2: Text-based detection
     text_rect = find_document_by_text(img_resized)
 
     if text_rect is not None:
-        x, y, w, h = text_rect
-        x = int(x / scale)
-        y = int(y / scale)
-        w = int(w / scale)
-        h = int(h / scale)
+        tx, ty, tw, th = text_rect
+        debug["text"] = f"found|x={int(tx/scale)},y={int(ty/scale)},w={int(tw/scale)},h={int(th/scale)}"
+
+        x = int(tx / scale)
+        y = int(ty / scale)
+        w = int(tw / scale)
+        h = int(th / scale)
 
         margin_x = int(width * margin_pct)
         margin_y = int(height * margin_pct)
@@ -453,17 +465,22 @@ def detect_and_crop_document(img, margin_pct=0.02):
         w = min(width - x, w + 2 * margin_x)
         h = min(height - y, h + 2 * margin_y)
 
-        return original[y:y+h, x:x+w], True, "text"
+        debug["text_crop"] = f"x={x},y={y},w={w},h={h}"
+        return original[y:y+h, x:x+w], True, "text", debug
+    else:
+        debug["text"] = "none_found"
 
     # Strategy 3: Bounding rect fallback
     bounding = find_document_bounding_rect(img_resized)
 
     if bounding is not None:
-        x, y, w, h = bounding
-        x = int(x / scale)
-        y = int(y / scale)
-        w = int(w / scale)
-        h = int(h / scale)
+        bx, by, bw, bh = bounding
+        debug["bounding"] = f"found|x={int(bx/scale)},y={int(by/scale)},w={int(bw/scale)},h={int(bh/scale)}"
+
+        x = int(bx / scale)
+        y = int(by / scale)
+        w = int(bw / scale)
+        h = int(bh / scale)
 
         margin_x = int(width * margin_pct)
         margin_y = int(height * margin_pct)
@@ -472,9 +489,11 @@ def detect_and_crop_document(img, margin_pct=0.02):
         w = min(width - x, w + 2 * margin_x)
         h = min(height - y, h + 2 * margin_y)
 
-        return original[y:y+h, x:x+w], True, "bounding"
+        return original[y:y+h, x:x+w], True, "bounding", debug
+    else:
+        debug["bounding"] = "none_found"
 
-    return original, False, "none"
+    return original, False, "none", debug
 
 
 # ─── ROUTES ────────────────────────────────────────────────────────
@@ -525,8 +544,9 @@ def crop():
         if img_type == "foto":
             cropped, detected = crop_face_portrait(img)
             strategy = "face"
+            debug = {}
         else:
-            cropped, detected, strategy = detect_and_crop_document(img, margin_pct)
+            cropped, detected, strategy, debug = detect_and_crop_document(img, margin_pct)
 
         # Evaluate quality
         quality = evaluate_quality(cropped, detected)
@@ -535,6 +555,9 @@ def crop():
         success, buffer = cv2.imencode(".png", cropped)
         if not success:
             return {"error": "Failed to encode cropped image"}, 500
+
+        # Build debug header string
+        debug_str = " | ".join(f"{k}={v}" for k, v in debug.items())
 
         response = Response(
             buffer.tobytes(),
@@ -549,7 +572,8 @@ def crop():
                 "X-Document-Detected": str(detected).lower(),
                 "X-Crop-Type": img_type,
                 "X-Crop-Strategy": strategy,
-                "Access-Control-Expose-Headers": "X-Quality-Overall, X-Quality-Sharpness, X-Quality-Lighting, X-Quality-Resolution, X-Quality-Contrast, X-Document-Detected, X-Crop-Type, X-Crop-Strategy"
+                "X-Debug": debug_str,
+                "Access-Control-Expose-Headers": "X-Quality-Overall, X-Quality-Sharpness, X-Quality-Lighting, X-Quality-Resolution, X-Quality-Contrast, X-Document-Detected, X-Crop-Type, X-Crop-Strategy, X-Debug"
             }
         )
         return response

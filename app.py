@@ -461,7 +461,7 @@ def find_document_by_gemini(img):
             return None, "encode_failed"
         img_b64 = base64.b64encode(buffer.tobytes()).decode("utf-8")
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 
         payload = {
             "contents": [{

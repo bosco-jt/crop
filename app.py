@@ -447,10 +447,10 @@ def find_document_by_smoothness(img_resized):
     return best_rect
 
 
-def gemini_remove_background(img):
+def gemini_detect_document(img):
     """
-    Use Gemini to remove background and replace with white.
-    Returns the processed image or None on failure.
+    Use Gemini 2.5 Flash to detect document position using percentages.
+    Returns ((x, y, w, h) in pixels, info_str) or (None, error_str).
     """
     if not GEMINI_API_KEY:
         return None, "no_api_key"
@@ -460,10 +460,11 @@ def gemini_remove_background(img):
         if not success:
             return None, "encode_failed"
         img_b64 = base64.b64encode(buffer.tobytes()).decode("utf-8")
+        img_h, img_w = img.shape[:2]
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
 
-        prompt = "Remove the background completely and replace with solid white (#FFFFFF). Keep the document exactly as it is - do not alter any text, numbers, photos or details on the document. Output the document on a clean white background."
+        prompt = 'Find the rectangular document (ID card, credit card, passport or similar) in this photo. Return its position as PERCENTAGES (0 to 100) of the image dimensions. Return ONLY a JSON object: {"left": 0, "top": 0, "right": 100, "bottom": 100}. "left" = percentage from left edge where document starts. "top" = percentage from top where document starts. "right" = percentage from left where document ends. "bottom" = percentage from top where document ends. It is better to include extra background than to cut the document. No markdown, no backticks, ONLY the JSON.'
 
         payload = {
             "contents": [{
@@ -472,71 +473,37 @@ def gemini_remove_background(img):
                     {"text": prompt}
                 ]
             }],
-            "generationConfig": {
-                "temperature": 0,
-                "maxOutputTokens": 1000,
-                "responseModalities": ["image", "text"],
-                "responseMimeType": "image/jpeg"
-            }
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 1000}
         }
 
-        resp = requests.post(url, json=payload, timeout=30)
+        resp = requests.post(url, json=payload, timeout=20)
         resp.raise_for_status()
         data = resp.json()
 
-        # Extract the generated image from response
-        for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
-            if "inlineData" in part:
-                img_data = base64.b64decode(part["inlineData"]["data"])
-                img_array = np.frombuffer(img_data, dtype=np.uint8)
-                result = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-                if result is not None:
-                    return result, None
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        text = text.replace("```json", "").replace("```", "").strip()
+        coords = json.loads(text)
 
-        # If no image in response, try text response for error info
-        for part in data.get("candidates", [{}])[0].get("content", {}).get("parts", []):
-            if "text" in part:
-                return None, f"text_response|{part['text'][:100]}"
+        left = float(coords["left"])
+        top = float(coords["top"])
+        right = float(coords["right"])
+        bottom = float(coords["bottom"])
 
-        return None, "no_image_in_response"
+        # Convert percentages to pixels
+        x = int(img_w * left / 100)
+        y = int(img_h * top / 100)
+        w = int(img_w * (right - left) / 100)
+        h = int(img_h * (bottom - top) / 100)
+
+        info = f"pcts=L{left:.1f},T{top:.1f},R{right:.1f},B{bottom:.1f}|px=x{x},y{y},w{w},h{h}"
+
+        if w < 50 or h < 50:
+            return None, f"too_small|{info}"
+
+        return (x, y, w, h), info
 
     except Exception as e:
         return None, str(e)
-
-
-def crop_white_background(img, margin=10):
-    """
-    Crop a document from an image with white background.
-    Finds the non-white region and crops to it.
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    # Threshold: anything not near-white is the document
-    _, binary = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
-
-    # Clean up noise
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    # Find contours
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if not contours:
-        return img, False
-
-    # Get bounding box of all non-white content
-    all_points = np.vstack(contours)
-    x, y, w, h = cv2.boundingRect(all_points)
-
-    # Add margin
-    height, width = img.shape[:2]
-    x = max(0, x - margin)
-    y = max(0, y - margin)
-    w = min(width - x, w + 2 * margin)
-    h = min(height - y, h + 2 * margin)
-
-    return img[y:y+h, x:x+w], True
 
 
 def detect_and_crop_document(img, margin_pct=0.02):
@@ -642,18 +609,23 @@ def detect_and_crop_document(img, margin_pct=0.02):
     else:
         debug["smooth"] = "none_found"
 
-    # Strategy 4: Gemini removes background + OpenCV crops the white-bg result
-    gemini_img, gemini_err = gemini_remove_background(original)
+    # Strategy 4: Gemini AI detects document position using percentages
+    gemini_rect, gemini_info = gemini_detect_document(original)
 
-    if gemini_img is not None:
-        cropped, detected = crop_white_background(gemini_img)
-        if detected:
-            debug["gemini"] = f"bg_removed|cropped"
-            return cropped, True, "gemini", debug
-        else:
-            debug["gemini"] = "bg_removed|crop_failed"
+    if gemini_rect is not None:
+        gx, gy, gw, gh = gemini_rect
+        debug["gemini"] = f"found|{gemini_info}"
+
+        margin_x = int(width * margin_pct)
+        margin_y = int(height * margin_pct)
+        x = max(0, gx - margin_x)
+        y = max(0, gy - margin_y)
+        w = min(width - x, gw + 2 * margin_x)
+        h = min(height - y, gh + 2 * margin_y)
+
+        return original[y:y+h, x:x+w], True, "gemini", debug
     else:
-        debug["gemini"] = f"failed|{gemini_err}"
+        debug["gemini"] = f"failed|{gemini_info}"
 
     # Strategy 5: Bounding rect fallback
     bounding = find_document_bounding_rect(img_resized)

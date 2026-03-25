@@ -3,7 +3,6 @@ import cv2
 import numpy as np
 import requests
 import os
-import io
 
 app = Flask(__name__)
 
@@ -84,9 +83,89 @@ def evaluate_quality(img, detected=True):
     if not detected:
         overall = min(overall, 25)
     return {
-        "overall": overall, "sharpness": sharpness,
-        "lighting": lighting, "resolution": resolution, "contrast": contrast
+        "overall": overall,
+        "sharpness": sharpness,
+        "lighting": lighting,
+        "resolution": resolution,
+        "contrast": contrast
     }
+
+
+# ─── HELPERS ───────────────────────────────────────────────────────
+
+def is_likely_mask_image(img):
+    """
+    Decide whether the Gemini image looks like a usable white-background mask.
+    We expect:
+    - a good amount of white background
+    - at least one meaningful non-white connected component
+    - not an almost totally white or almost unchanged noisy image
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    white_ratio = np.sum(gray > 245) / gray.size
+    if white_ratio < 0.35 or white_ratio > 0.995:
+        return False
+
+    _, binary = cv2.threshold(gray, 245, 255, cv2.THRESH_BINARY_INV)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    img_area = img.shape[0] * img.shape[1]
+
+    large_components = 0
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area > img_area * 0.03:
+            large_components += 1
+
+    return large_components >= 1
+
+
+def detect_coordinates_from_mask(img):
+    """
+    Detect main object coordinates from a likely white-background mask image.
+    Returns (x_pct, y_pct, w_pct, h_pct, strategy) or None.
+    """
+    height, width = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    _, binary = cv2.threshold(gray, 245, 255, cv2.THRESH_BINARY_INV)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    img_area = width * height
+    candidates = []
+
+    for i in range(1, num_labels):
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        area = stats[i, cv2.CC_STAT_AREA]
+
+        bbox_area = w * h
+        fill_ratio = area / max(bbox_area, 1)
+        aspect = max(w, h) / max(min(w, h), 1)
+
+        # Condiciones amplias para DNI, carnet, capturas, etc.
+        if bbox_area > img_area * 0.05 and 1.0 < aspect < 3.8 and fill_ratio > 0.20:
+            candidates.append((bbox_area, area, x, y, w, h, aspect, fill_ratio))
+
+    if not candidates:
+        return None
+
+    # Preferimos el bbox grande y razonablemente compacto
+    candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    _, _, x, y, w, h, _, _ = candidates[0]
+
+    return (x / width, y / height, w / width, h / height, "white_bg")
 
 
 # ─── FACE CROP ─────────────────────────────────────────────────────
@@ -98,7 +177,8 @@ def crop_face_portrait(img):
     gray = cv2.equalizeHist(gray)
 
     face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    )
 
     faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(50, 50))
     if len(faces) == 0:
@@ -133,45 +213,13 @@ def crop_face_portrait(img):
 
 def crop_document(img, margin_pct=0.02):
     """
-    Crop document from image. Works best when background has been replaced
-    with white by Gemini. Falls back to contour detection for other cases.
+    Crop document from image directly.
+    Used as fallback when Gemini mask is not usable.
     Returns (cropped_image, detected, strategy).
     """
     original = img.copy()
     height, width = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Strategy 1: White background crop (for Gemini-processed images)
-    # Check if image has significant white areas (>15% near-white pixels)
-    white_pixels = np.sum(gray > 240) / gray.size
-    if white_pixels > 0.15:
-        _, binary = cv2.threshold(gray, 235, 255, cv2.THRESH_BINARY_INV)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=3)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        if contours:
-            # Get bounding box of all non-white content
-            all_points = np.vstack(contours)
-            x, y, w, h = cv2.boundingRect(all_points)
-
-            # Validate: should be document-shaped
-            crop_area = w * h
-            img_area = width * height
-            aspect = max(w, h) / max(min(w, h), 1)
-
-            if crop_area > img_area * 0.08 and 1.0 < aspect < 3.5:
-                margin_x = int(w * margin_pct)
-                margin_y = int(h * margin_pct)
-                x = max(0, x - margin_x)
-                y = max(0, y - margin_y)
-                w = min(width - x, w + 2 * margin_x)
-                h = min(height - y, h + 2 * margin_y)
-                return original[y:y+h, x:x+w], True, "white_bg"
-
-    # Strategy 2: Contour-based detection (for non-white backgrounds)
     scale = 1.0
     max_dim = 1000
     if max(height, width) > max_dim:
@@ -189,8 +237,10 @@ def crop_document(img, margin_pct=0.02):
 
     strategies = [
         cv2.Canny(blurred, 30, 200),
-        cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                              cv2.THRESH_BINARY_INV, 11, 2),
+        cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 11, 2
+        ),
         cv2.Canny(blurred, 10, 80),
         cv2.Canny(sat, 20, 100),
         cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1],
@@ -202,9 +252,12 @@ def crop_document(img, margin_pct=0.02):
     for edged in strategies:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         dilated = cv2.dilate(edged, kernel, iterations=2)
-        closed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE,
-                                   cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
-                                   iterations=2)
+        closed = cv2.morphologyEx(
+            dilated,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
+            iterations=2
+        )
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             continue
@@ -217,7 +270,7 @@ def crop_document(img, margin_pct=0.02):
                 if img_area * 0.10 < contour_area < img_area * 0.75:
                     bx, by, bw, bh = cv2.boundingRect(approx)
                     aspect = max(bw, bh) / max(min(bw, bh), 1)
-                    if 1.1 < aspect < 3.0 and contour_area > best_area:
+                    if 1.1 < aspect < 3.2 and contour_area > best_area:
                         best_area = contour_area
                         best_contour = approx
 
@@ -225,7 +278,6 @@ def crop_document(img, margin_pct=0.02):
         best_contour = (best_contour / scale).astype(int)
         pts = best_contour.reshape(4, 2)
 
-        # Order points
         rect = np.zeros((4, 2), dtype="float32")
         s = pts.sum(axis=1)
         rect[0] = pts[np.argmin(s)]
@@ -234,7 +286,6 @@ def crop_document(img, margin_pct=0.02):
         rect[1] = pts[np.argmin(d)]
         rect[3] = pts[np.argmax(d)]
 
-        # Add margin
         mx = int(width * margin_pct)
         my = int(height * margin_pct)
         rect[0] = [max(0, rect[0][0] - mx), max(0, rect[0][1] - my)]
@@ -246,41 +297,34 @@ def crop_document(img, margin_pct=0.02):
         max_w = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
         max_h = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
 
-        dst = np.array([[0, 0], [max_w-1, 0], [max_w-1, max_h-1], [0, max_h-1]], dtype="float32")
-        matrix = cv2.getPerspectiveTransform(rect.astype("float32"), dst)
-        warped = cv2.warpPerspective(original, matrix, (max_w, max_h))
-        return warped, True, "contour"
+        if max_w > 10 and max_h > 10:
+            dst = np.array(
+                [[0, 0], [max_w - 1, 0], [max_w - 1, max_h - 1], [0, max_h - 1]],
+                dtype="float32"
+            )
+            matrix = cv2.getPerspectiveTransform(rect.astype("float32"), dst)
+            warped = cv2.warpPerspective(original, matrix, (max_w, max_h))
+            return warped, True, "contour"
 
     return original, False, "none"
 
 
 def detect_coordinates(img, margin_pct=0.02):
     """
-    Detect document coordinates in an image (typically white-bg from Gemini).
-    Returns (x, y, w, h, strategy) or None.
+    Detect document coordinates.
+    Priority:
+    1) If image looks like usable Gemini mask -> use mask detection
+    2) Else -> fallback to contour detection
+    Returns (x, y, w, h, strategy) as percentages or None.
     """
     height, width = img.shape[:2]
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Strategy 1: White background detection
-    white_pixels = np.sum(gray > 240) / gray.size
-    if white_pixels > 0.15:
-        _, binary = cv2.threshold(gray, 210, 255, cv2.THRESH_BINARY_INV)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=3)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    if is_likely_mask_image(img):
+        result = detect_coordinates_from_mask(img)
+        if result is not None:
+            return result
 
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            all_points = np.vstack(contours)
-            x, y, w, h = cv2.boundingRect(all_points)
-            crop_area = w * h
-            img_area = width * height
-            if crop_area > img_area * 0.08:
-                # Return as percentages for cross-image mapping
-                return (x / width, y / height, w / width, h / height, "white_bg")
-
-    # Strategy 2: Contour detection (fallback)
+    # Fallback contour detection
     scale = 1.0
     max_dim = 1000
     if max(height, width) > max_dim:
@@ -306,21 +350,24 @@ def detect_coordinates(img, margin_pct=0.02):
     for edged in strategies:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         dilated = cv2.dilate(edged, kernel, iterations=2)
-        closed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE,
-                                   cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
-                                   iterations=2)
+        closed = cv2.morphologyEx(
+            dilated,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
+            iterations=2
+        )
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             continue
+
         for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:10]:
             peri = cv2.arcLength(contour, True)
             approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
             if len(approx) == 4:
                 contour_area = cv2.contourArea(approx)
-                if img_area * 0.10 < contour_area < img_area * 0.75:
-                    if contour_area > best_area:
-                        best_area = contour_area
-                        best_contour = approx
+                if img_area * 0.10 < contour_area < img_area * 0.75 and contour_area > best_area:
+                    best_area = contour_area
+                    best_contour = approx
 
     if best_contour is not None:
         x, y, w, h = cv2.boundingRect(best_contour)
@@ -332,33 +379,34 @@ def detect_coordinates(img, margin_pct=0.02):
 
 def crop_document_dual(detect_img, crop_img, margin_pct=0.02):
     """
-    Detect document position on detect_img (Gemini processed),
+    Detect document position on detect_img (Gemini processed if usable),
     then crop crop_img (original) using those coordinates.
-    Coordinates are mapped via percentages so different image sizes work.
+    If mask is not usable, fallback to direct crop on original.
     """
-    result = detect_coordinates(detect_img, margin_pct)
+    mask_usable = is_likely_mask_image(detect_img)
 
-    if result is not None:
-        pct_x, pct_y, pct_w, pct_h, strategy = result
-        h, w = crop_img.shape[:2]
+    if mask_usable:
+        result = detect_coordinates(detect_img, margin_pct)
+        if result is not None:
+            pct_x, pct_y, pct_w, pct_h, strategy = result
+            h, w = crop_img.shape[:2]
 
-        # Map percentages to original image pixels
-        x = int(pct_x * w)
-        y = int(pct_y * h)
-        cw = int(pct_w * w)
-        ch = int(pct_h * h)
+            x = int(pct_x * w)
+            y = int(pct_y * h)
+            cw = int(pct_w * w)
+            ch = int(pct_h * h)
 
-        # Add margin
-        mx = int(cw * margin_pct)
-        my = int(ch * margin_pct)
-        x = max(0, x - mx)
-        y = max(0, y - my)
-        cw = min(w - x, cw + 2 * mx)
-        ch = min(h - y, ch + 2 * my)
+            mx = int(cw * margin_pct)
+            my = int(ch * margin_pct)
+            x = max(0, x - mx)
+            y = max(0, y - my)
+            cw = min(w - x, cw + 2 * mx)
+            ch = min(h - y, ch + 2 * my)
 
-        return crop_img[y:y+ch, x:x+cw], True, strategy
+            if cw > 10 and ch > 10:
+                return crop_img[y:y + ch, x:x + cw], True, strategy
 
-    # Fallback: try direct crop on original
+    # Fallback: detect directly on original
     return crop_document(crop_img, margin_pct)
 
 
@@ -373,22 +421,22 @@ def health():
 def crop():
     """
     Crop a document or face from an image.
-    
+
     Mode 1 - Detect on processed image, crop the original:
       Content-Type: multipart/form-data
       - file: binary image (Gemini-processed with white bg, used for detection)
       - original_url: URL of original image (will be cropped)
       - margin: optional (default 0.02)
       - type: optional ("foto" for face crop)
-    
+
     Mode 2 - Simple crop (detect + crop same image):
       Content-Type: application/json
       { "image_url": "...", "margin": 0.03, "type": "foto" }
-    
+
     Mode 3 - Binary image:
       Content-Type: image/*
       Binary image data
-    
+
     Returns: cropped PNG with quality headers.
     """
     try:
@@ -397,9 +445,9 @@ def crop():
         margin_pct = 0.02
         detect_img = None
         crop_img = None
+        mask_usable = False
 
         if "multipart/form-data" in content_type:
-            # Mode 1: Gemini image for detection + original URL for cropping
             file = request.files.get("file")
             if not file:
                 return {"error": "file is required in multipart"}, 400
@@ -419,7 +467,6 @@ def crop():
                 crop_img = detect_img
 
         elif "application/json" in content_type:
-            # Mode 2: JSON with URL
             data = request.get_json(silent=True)
             if not data or "image_url" not in data:
                 return {"error": "image_url is required"}, 400
@@ -429,7 +476,6 @@ def crop():
             img_type = data.get("type", "document")
 
         elif "image/" in content_type or "application/octet-stream" in content_type:
-            # Mode 3: Binary image
             img_array = np.frombuffer(request.data, dtype=np.uint8)
             detect_img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
             if detect_img is None:
@@ -437,13 +483,16 @@ def crop():
             crop_img = detect_img
 
         else:
-            return {"error": "Send multipart with file+original_url, JSON with image_url, or binary image"}, 400
+            return {
+                "error": "Send multipart with file+original_url, JSON with image_url, or binary image"
+            }, 400
+
+        mask_usable = is_likely_mask_image(detect_img)
 
         if img_type == "foto":
             cropped, detected = crop_face_portrait(crop_img)
             strategy = "face"
         else:
-            # Detect on detect_img (Gemini processed), crop on crop_img (original)
             cropped, detected, strategy = crop_document_dual(detect_img, crop_img, margin_pct)
 
         quality = evaluate_quality(cropped, detected)
@@ -465,7 +514,12 @@ def crop():
                 "X-Document-Detected": str(detected).lower(),
                 "X-Crop-Type": img_type,
                 "X-Crop-Strategy": strategy,
-                "Access-Control-Expose-Headers": "X-Quality-Overall, X-Quality-Sharpness, X-Quality-Lighting, X-Quality-Resolution, X-Quality-Contrast, X-Document-Detected, X-Crop-Type, X-Crop-Strategy"
+                "X-Mask-Usable": str(mask_usable).lower(),
+                "Access-Control-Expose-Headers": (
+                    "X-Quality-Overall, X-Quality-Sharpness, X-Quality-Lighting, "
+                    "X-Quality-Resolution, X-Quality-Contrast, X-Document-Detected, "
+                    "X-Crop-Type, X-Crop-Strategy, X-Mask-Usable"
+                )
             }
         )
 

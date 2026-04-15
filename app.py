@@ -93,6 +93,18 @@ def evaluate_quality(img, detected=True):
 
 # ─── HELPERS ───────────────────────────────────────────────────────
 
+def get_default_margin(img_type):
+    """
+    Default margin by type.
+    Documents need a bit more breathing room to avoid cutting corners.
+    """
+    if img_type == "foto":
+        return 0.02
+    if img_type == "puntos":
+        return 0.03
+    return 0.05
+
+
 def is_likely_mask_image(img):
     """
     Decide whether the Gemini image looks like a usable white-background mask.
@@ -211,7 +223,7 @@ def crop_face_portrait(img):
 
 # ─── DOCUMENT CROP ─────────────────────────────────────────────────
 
-def crop_document(img, margin_pct=0.02):
+def crop_document(img, margin_pct=0.05):
     """
     Crop document from image directly.
     Used as fallback when Gemini mask is not usable.
@@ -286,8 +298,16 @@ def crop_document(img, margin_pct=0.02):
         rect[1] = pts[np.argmin(d)]
         rect[3] = pts[np.argmax(d)]
 
-        mx = int(width * margin_pct)
-        my = int(height * margin_pct)
+        # Margen calculado sobre el bbox real del documento, no sobre toda la imagen
+        bx, by, bw, bh = cv2.boundingRect(best_contour)
+        bx = int(bx / scale)
+        by = int(by / scale)
+        bw = max(1, int(bw / scale))
+        bh = max(1, int(bh / scale))
+
+        mx = max(int(bw * margin_pct), 16)
+        my = max(int(bh * margin_pct), 16)
+
         rect[0] = [max(0, rect[0][0] - mx), max(0, rect[0][1] - my)]
         rect[1] = [min(width, rect[1][0] + mx), max(0, rect[1][1] - my)]
         rect[2] = [min(width, rect[2][0] + mx), min(height, rect[2][1] + my)]
@@ -309,7 +329,7 @@ def crop_document(img, margin_pct=0.02):
     return original, False, "none"
 
 
-def detect_coordinates(img, margin_pct=0.02):
+def detect_coordinates(img, margin_pct=0.05):
     """
     Detect document coordinates.
     Priority:
@@ -377,7 +397,7 @@ def detect_coordinates(img, margin_pct=0.02):
     return None
 
 
-def crop_document_dual(detect_img, crop_img, margin_pct=0.02):
+def crop_document_dual(detect_img, crop_img, margin_pct=0.05):
     """
     Detect document position on detect_img (Gemini processed if usable),
     then crop crop_img (original) using those coordinates.
@@ -396,15 +416,20 @@ def crop_document_dual(detect_img, crop_img, margin_pct=0.02):
             cw = int(pct_w * w)
             ch = int(pct_h * h)
 
-            mx = int(cw * margin_pct)
-            my = int(ch * margin_pct)
-            x = max(0, x - mx)
-            y = max(0, y - my)
-            cw = min(w - x, cw + 2 * mx)
-            ch = min(h - y, ch + 2 * my)
+            # Margen relativo + minimo fijo para no comerse esquinas
+            mx = max(int(cw * margin_pct), 16)
+            my = max(int(ch * margin_pct), 16)
 
-            if cw > 10 and ch > 10:
-                return crop_img[y:y + ch, x:x + cw], True, strategy
+            x1 = max(0, x - mx)
+            y1 = max(0, y - my)
+            x2 = min(w, x + cw + mx)
+            y2 = min(h, y + ch + my)
+
+            final_w = x2 - x1
+            final_h = y2 - y1
+
+            if final_w > 10 and final_h > 10:
+                return crop_img[y1:y2, x1:x2], True, strategy
 
     # Fallback: detect directly on original
     return crop_document(crop_img, margin_pct)
@@ -426,7 +451,7 @@ def crop():
       Content-Type: multipart/form-data
       - file: binary image (Gemini-processed with white bg, used for detection)
       - original_url: URL of original image (will be cropped)
-      - margin: optional (default 0.02)
+      - margin: optional
       - type: optional ("foto" for face crop)
 
     Mode 2 - Simple crop (detect + crop same image):
@@ -442,7 +467,7 @@ def crop():
     try:
         content_type = request.content_type or ""
         img_type = "document"
-        margin_pct = 0.02
+        margin_pct = get_default_margin(img_type)
         detect_img = None
         crop_img = None
         mask_usable = False
@@ -458,8 +483,8 @@ def crop():
                 return {"error": "Could not decode uploaded image"}, 400
 
             original_url = request.form.get("original_url", "")
-            margin_pct = float(request.form.get("margin", 0.02))
             img_type = request.form.get("type", "document")
+            margin_pct = float(request.form.get("margin", get_default_margin(img_type)))
 
             if original_url:
                 crop_img = download_image(original_url)
@@ -472,8 +497,8 @@ def crop():
                 return {"error": "image_url is required"}, 400
             detect_img = download_image(data["image_url"])
             crop_img = detect_img
-            margin_pct = float(data.get("margin", 0.02))
             img_type = data.get("type", "document")
+            margin_pct = float(data.get("margin", get_default_margin(img_type)))
 
         elif "image/" in content_type or "application/octet-stream" in content_type:
             img_array = np.frombuffer(request.data, dtype=np.uint8)
@@ -481,6 +506,8 @@ def crop():
             if detect_img is None:
                 return {"error": "Could not decode image from body"}, 400
             crop_img = detect_img
+            img_type = "document"
+            margin_pct = get_default_margin(img_type)
 
         else:
             return {
